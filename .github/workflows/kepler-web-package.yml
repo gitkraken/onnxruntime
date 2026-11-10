@@ -1,0 +1,123 @@
+# Builds @gitkraken/onnxruntime-web: the upstream onnxruntime-web nightly this branch is based on,
+# with the fixes committed on top of it. Only the WebGPU EP builds (asyncify and JSPI) contain
+# the patched kernels; the plain and JSEP builds are taken unchanged from the upstream package
+# of the same commit, then js/web regenerates every JS bundle around the four builds.
+#
+# Push a tag `kepler-web-v<version>` from this branch to build, release and publish <version>.
+name: Kepler onnxruntime-web package
+
+on:
+  push:
+    tags:
+      - 'kepler-web-v*'
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_PACKAGE: onnxruntime-web@1.31.0-dev.20260914-8d85527a0
+  UPSTREAM_COMMON: 1.31.0-dev.20260911-2a43ec07e
+  PACKAGE_NAME: '@gitkraken/onnxruntime-web'
+
+jobs:
+  wasm:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - variant: asyncify
+            extra: --enable_wasm_api_exception_catching
+          - variant: jspi
+            extra: --enable_wasm_jspi
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install cmake==3.31.6 ninja flatbuffers numpy packaging
+      - name: Build WebGPU ${{ matrix.variant }}
+        run: |
+          python ./tools/ci_build/build.py \
+            --parallel 4 --config Release --skip_submodule_sync --cmake_generator Ninja \
+            --build_wasm --enable_wasm_simd --enable_wasm_threads \
+            --build_dir "$RUNNER_TEMP/wasm" \
+            --use_webgpu --use_webnn --target onnxruntime_webassembly \
+            ${{ matrix.extra }} \
+            --disable_ml_ops --disable_generation_ops \
+            --disable_types string float4 float8 optional sparsetensor \
+            --include_ops_by_config onnxruntime/wasm/reduced_types.config \
+            --enable_reduced_operator_type_support \
+            --skip_tests
+          mkdir -p wasm-out
+          cp "$RUNNER_TEMP/wasm/Release/ort-wasm-simd-threaded.${{ matrix.variant }}.wasm" wasm-out/
+          cp "$RUNNER_TEMP/wasm/Release/ort-wasm-simd-threaded.${{ matrix.variant }}.mjs" wasm-out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-${{ matrix.variant }}
+          path: wasm-out/
+
+  package:
+    needs: wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org/
+      - name: Version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#kepler-web-v}" >> "$GITHUB_ENV"
+      - name: Collect wasm builds
+        run: |
+          mkdir -p js/web/dist upstream
+          npm pack "$UPSTREAM_PACKAGE" --pack-destination upstream
+          tar -xzf upstream/*.tgz -C upstream
+          for f in ort-wasm-simd-threaded.wasm ort-wasm-simd-threaded.mjs ort-wasm-simd-threaded.jsep.wasm ort-wasm-simd-threaded.jsep.mjs; do
+            cp "upstream/package/dist/$f" js/web/dist/
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wasm-*
+          path: js/web/dist
+          merge-multiple: true
+      - name: Build js/web
+        run: |
+          ls -la js/web/dist
+          (cd js && npm ci)
+          (cd js/common && npm ci)
+          (cd js/web && npm ci && npm run build)
+      - name: Name, version and dependencies
+        working-directory: js/web
+        run: |
+          node -e "
+            const fs = require('node:fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.name = process.env.PACKAGE_NAME;
+            pkg.version = process.env.VERSION;
+            pkg.dependencies['onnxruntime-common'] = process.env.UPSTREAM_COMMON;
+            pkg.repository = { type: 'git', url: 'git+https://github.com/gitkraken/onnxruntime.git', directory: 'js/web' };
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          npm pack --ignore-scripts
+          sha256sum ./*.tgz
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" js/web/*.tgz --target "$GITHUB_SHA" \
+            --title "$PACKAGE_NAME $VERSION" \
+            --notes "Upstream $UPSTREAM_PACKAGE with the commits on top of it in this tag. Built by run $GITHUB_RUN_ID."
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN_GITKRAKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN_GITKRAKEN is not available to this repository"
+            exit 1
+          fi
+          npm publish js/web/*.tgz --access public --tag kepler
